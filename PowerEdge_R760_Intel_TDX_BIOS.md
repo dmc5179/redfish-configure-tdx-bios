@@ -39,16 +39,39 @@ TDX VMs will run but cannot be cryptographically verified by a remote party.
 | `SgxPackageInfoInBandAccess` | `On` | Allows OS/containers to read platform provisioning data (enc_ppid, manifest) |
 | `SgxFactoryReset` | `On` (one-time) | Triggers Initial Platform Establishment — re-generates keys and forces fresh registration. Only needed if platform was never registered. Resets to `Off` after boot. |
 
-## 5. Initialization & Activation
+## 5. Attribute Dependencies
+
+The BIOS registry enforces runtime dependencies between SGX attributes:
+
+- **When `SgxFactoryReset` is `On`** (current value or pending):
+  - `SgxAutoRegistrationAgent` becomes **read-only** (forced to `Disabled`)
+  - `SgxPackageInfoInBandAccess` becomes **read-only** (forced to `Off`)
+
+This means `SgxFactoryReset` and the registration settings **cannot be applied
+in the same PATCH or the same reboot**. The remediate script handles this
+automatically:
+
+1. Apply `SgxFactoryReset=On` → reboot → factory reset completes, resets to `Off`
+2. Re-run script → apply `SgxAutoRegistrationAgent=Enabled` + `SgxPackageInfoInBandAccess=On` → reboot
+3. MPA registration happens during this second boot
+
+Other dependencies:
+- `SgxAutoRegistrationAgent` is hidden when `IntelSgx=Off`
+- `SgxPackageInfoInBandAccess` is hidden when `MemoryEncryption=Disabled`
+
+## 6. Initialization & Activation
 
 1. TDX-dependent attributes (`EnableTdx`, `KeySplit`, `EnableTdxSeamldr`) are not
    visible until `MemoryEncryption=MultipleKeys` is applied and the server reboots.
    This means enabling TDX from scratch requires **two reboots**.
 
-2. After enabling `SgxAutoRegistrationAgent`, the BIOS MPA will attempt to register
+2. SGX Factory Reset + registration requires an additional reboot cycle (see
+   section 5). From a clean start, this means up to **three reboots** total.
+
+3. After enabling `SgxAutoRegistrationAgent`, the BIOS MPA will attempt to register
    the platform with Intel's Registration Service on the next boot. This requires
    outbound HTTPS connectivity during boot. After successful registration, the
    platform identity persists and internet access is no longer needed.
 
-3. The SEAM loader may require a full power cycle (not just a warm reboot) to
-   initialize. The remediate script uses `GracefulRebootWithPowerCycle`.
+4. The SEAM loader may require a full power cycle (not just a warm reboot) to
+   initialize. The remediate script uses `PowerCycle` reset type.

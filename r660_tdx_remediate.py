@@ -72,6 +72,46 @@ def parse_args():
     return args
 
 
+def _check_pending_settings(host, username, password):
+    """Return the current pending BIOS settings (staged for next reboot)."""
+    url = f"https://{host}/redfish/v1/Systems/System.Embedded.1/Bios/Settings"
+    resp = requests.get(url, auth=(username, password), verify=False, timeout=30)
+    if resp.status_code != 200:
+        return {}
+    return resp.json().get("Attributes", {})
+
+
+def _clear_pending_settings(host, username, password, keep_keys=None):
+    """Clear pending BIOS settings by resetting them to current values.
+
+    If keep_keys is provided, only those pending attributes are preserved.
+    """
+    pending = _check_pending_settings(host, username, password)
+    if not pending:
+        return
+
+    base_url = f"https://{host}/redfish/v1/Systems/System.Embedded.1/Bios"
+    resp = requests.get(base_url, auth=(username, password), verify=False, timeout=30)
+    if resp.status_code != 200:
+        return
+    current = resp.json().get("Attributes", {})
+
+    reset_attrs = {}
+    for k, v in pending.items():
+        if keep_keys and k in keep_keys:
+            continue
+        curr_val = current.get(k)
+        if curr_val is not None and str(curr_val) != str(v):
+            reset_attrs[k] = curr_val
+
+    if reset_attrs:
+        settings_url = f"{base_url}/Settings"
+        requests.patch(
+            settings_url, auth=(username, password),
+            json={"Attributes": reset_attrs}, verify=False, timeout=30,
+        )
+
+
 def apply_tdx_settings(host, username, password, sgx_factory_reset=False, dry_run=False):
     base_url = f"https://{host}/redfish/v1/Systems/System.Embedded.1/Bios"
     settings_url = f"{base_url}/Settings"
@@ -89,6 +129,18 @@ def apply_tdx_settings(host, username, password, sgx_factory_reset=False, dry_ru
     except Exception as e:
         print(f"Connection failed: {e}")
         sys.exit(1)
+
+    pending = _check_pending_settings(host, username, password)
+    if pending:
+        print(f"  Found {len(pending)} pending (staged) setting(s)")
+
+    # BIOS dependency: when SgxFactoryReset is On (current or pending),
+    # SgxAutoRegistrationAgent and SgxPackageInfoInBandAccess become read-only.
+    # Must apply factory reset first, reboot, then set registration attributes.
+    factory_reset_active = (
+        current_settings.get("SgxFactoryReset") == "On"
+        or pending.get("SgxFactoryReset") == "On"
+    )
 
     prerequisite_changes = {}
     tdx_dependent_changes = {}
@@ -113,7 +165,7 @@ def apply_tdx_settings(host, username, password, sgx_factory_reset=False, dry_ru
 
     if sgx_factory_reset:
         curr_factory = current_settings.get("SgxFactoryReset", "Off")
-        if curr_factory != "On":
+        if curr_factory != "On" and "SgxFactoryReset" not in pending:
             registration_changes["SgxFactoryReset"] = "On"
 
     has_prereq = len(prerequisite_changes) > 0
@@ -121,8 +173,39 @@ def apply_tdx_settings(host, username, password, sgx_factory_reset=False, dry_ru
     has_reg = len(registration_changes) > 0
 
     if not has_prereq and not has_tdx and not has_reg:
+        if factory_reset_active:
+            print()
+            print("SGX Factory Reset is pending. Registration attributes are locked")
+            print("until the factory reset completes (next reboot).")
+            print()
+            if not dry_run:
+                print("Creating config job to apply pending factory reset...")
+                if not create_bios_config_job_and_reboot(host, username, password):
+                    sys.exit(1)
+                print()
+                print("=" * 70)
+                print("ACTION REQUIRED: Run this script again after the server reboots")
+                print("(~15-20 min). The factory reset will complete, unlocking the")
+                print("registration attributes for the next run.")
+                print("=" * 70)
+            else:
+                print("[DRY RUN] Would create config job and reboot to apply factory reset.")
+            sys.exit(0)
         print("All required BIOS settings are already correct. No changes needed.")
         sys.exit(0)
+
+    # When factory reset is active, registration attributes are read-only.
+    # Split them out and defer to the next run.
+    deferred_registration = {}
+    if factory_reset_active and has_reg:
+        for k in list(registration_changes.keys()):
+            if k in SGX_REGISTRATION_SETTINGS:
+                deferred_registration[k] = registration_changes.pop(k)
+        has_reg = len(registration_changes) > 0
+        if deferred_registration:
+            print()
+            print(f"  NOTE: {list(deferred_registration.keys())} deferred — read-only while")
+            print("  SgxFactoryReset is active. Will be applied on next run after reboot.")
 
     if has_prereq and has_tdx:
         print("Step 2: Two-phase remediation required.")
@@ -136,17 +219,37 @@ def apply_tdx_settings(host, username, password, sgx_factory_reset=False, dry_ru
     elif has_prereq or has_reg:
         payload_attributes = {**prerequisite_changes, **registration_changes}
         print(f"Step 2: Applying changes: {list(payload_attributes.keys())}")
-        needs_rerun = False
+        needs_rerun = bool(deferred_registration)
     else:
         payload_attributes = tdx_dependent_changes
         print(f"Step 2: Applying TDX-dependent changes: {list(payload_attributes.keys())}")
-        needs_rerun = False
+        needs_rerun = bool(deferred_registration)
+
+    if not payload_attributes and factory_reset_active:
+        print()
+        print("No immediately applicable changes. Applying pending factory reset...")
+        if not dry_run:
+            if not create_bios_config_job_and_reboot(host, username, password):
+                sys.exit(1)
+            print()
+            print("=" * 70)
+            print("ACTION REQUIRED: Run this script again after the server reboots")
+            print("(~15-20 min) to apply deferred registration settings.")
+            print("=" * 70)
+        else:
+            print("[DRY RUN] Would create config job and reboot.")
+        sys.exit(0)
 
     if dry_run:
         print("\n[DRY RUN] Would apply the following BIOS attribute changes:")
         for k, v in payload_attributes.items():
             curr = current_settings.get(k)
             print(f"  {k}: '{curr}' -> '{v}'")
+        if deferred_registration:
+            print(f"\n[DRY RUN] Deferred to next run (after factory reset reboot):")
+            for k, v in deferred_registration.items():
+                curr = current_settings.get(k)
+                print(f"  {k}: '{curr}' -> '{v}'")
         print("\n[DRY RUN] No changes applied. Remove --dry-run to apply.")
         sys.exit(0)
 
@@ -170,15 +273,19 @@ def apply_tdx_settings(host, username, password, sgx_factory_reset=False, dry_ru
 
     print("\nRemediation job scheduled. The server will now reboot.")
     print()
-    if needs_rerun:
+    if needs_rerun or deferred_registration:
         print("=" * 70)
         print("ACTION REQUIRED: Run this script again after the server reboots.")
         print()
-        print("Prerequisite settings are being applied now. Once the reboot")
-        print("completes (~15-20 min for bare metal), re-run this script to")
-        print("apply TDX-specific settings that require TME-MT to be active.")
+        if has_prereq and has_tdx:
+            print("Prerequisite settings are being applied now. Once the reboot")
+            print("completes (~15-20 min for bare metal), re-run this script to")
+            print("apply TDX-specific settings that require TME-MT to be active.")
+        if deferred_registration:
+            print("SGX registration settings will be applied on the next run")
+            print("(they are read-only while SgxFactoryReset is active).")
         print()
-        print("This second run will trigger one additional reboot.")
+        print("Additional reboot(s) will be needed.")
         print("=" * 70)
     else:
         if "EnableTdxSeamldr" in payload_attributes:

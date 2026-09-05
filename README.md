@@ -2,6 +2,13 @@
 
 Scripts for auditing and remediating Intel TDX BIOS settings on Dell PowerEdge servers via iDRAC Redfish API. Covers both TDX enablement and SGX attestation registration — the latter is required for TDX remote attestation to work end-to-end.
 
+## Hardware Prerequisites
+
+Before running these scripts, review **[PREREQUISITES.md](PREREQUISITES.md)** for:
+- **SGX Platform Registration** — required for TDX remote attestation. Two options for disconnected environments: register before air-gapping (recommended), or use in-band registration via USB sneakernet.
+- **BIOS configuration order** — settings have multi-reboot dependencies.
+- **When to perform these steps** — should be done before OpenShift installation.
+
 ## Supported Platforms
 
 | Model | Audit | Remediate | Verified |
@@ -69,6 +76,8 @@ The reboot analysis tells you how many reboots are needed:
 | Only prerequisite OR only TDX-dependent changes needed | 1 |
 | Both prerequisite AND TDX-dependent changes needed | 2 |
 | Only SGX registration changes needed | 1 |
+| SGX factory reset + registration changes needed | 2 (factory reset must complete before registration attrs are writable) |
+| Full clean start (prerequisites + TDX + factory reset + registration) | 3 |
 
 JSON output for automation:
 
@@ -93,12 +102,15 @@ Options:
 | `--dry-run` | Show what would be changed without applying |
 | `--sgx-factory-reset` | Also set `SgxFactoryReset=On` to trigger Initial Platform Establishment (needed if platform was never registered with Intel) |
 
-When both prerequisite and TDX-dependent settings need changes, the script handles this automatically:
+The script handles multi-step dependencies automatically. Just re-run after each reboot until it reports "No changes needed":
 
-1. **First run** — applies only prerequisite settings (+ registration settings) and triggers a reboot.
-2. **Second run** — detects prerequisites are satisfied, applies TDX-dependent settings, and triggers a final reboot.
+1. **First run** — applies prerequisite settings and `SgxFactoryReset=On`, triggers reboot.
+2. **Second run** — detects factory reset completed. If TDX-dependent settings are now visible, applies those. Applies SGX registration settings (now writable since factory reset is `Off`). Triggers reboot.
+3. **Third run** (if needed) — applies any remaining TDX-dependent or registration settings.
 
-This two-phase approach is necessary because TDX BIOS attributes are not visible until TME-MT is active.
+### SGX Factory Reset dependency
+
+The BIOS registry enforces a dependency: when `SgxFactoryReset` is `On` (even just pending), `SgxAutoRegistrationAgent` and `SgxPackageInfoInBandAccess` become **read-only**. The script detects this and defers registration settings to the next run after the factory reset reboot completes.
 
 ## iDRAC Firmware Compatibility
 
@@ -129,13 +141,15 @@ If the platform has never been registered (e.g., Intel PCS returns 404 for PCK c
 
 ### Disconnected / Air-Gapped Environments
 
-The BIOS MPA registers directly with Intel's cloud service, which won't work in a disconnected environment. For air-gapped deployments:
+The BIOS MPA registers directly with Intel's cloud Registration Service, which won't work in a disconnected environment. Two options:
 
-1. **Pre-deployment (internet-connected):** Enable `SgxAutoRegistrationAgent` and reboot the server while it still has outbound HTTPS access. After the one-time registration, the platform identity persists — internet is no longer needed.
+1. **Option A (Recommended): Register before air-gapping.** Enable `SgxAutoRegistrationAgent` and reboot the server while it still has outbound HTTPS access. After the one-time registration, the platform identity persists — internet is no longer needed.
 
-2. **Or use in-band registration:** With `SgxPackageInfoInBandAccess=On`, the OS can read the platform's encrypted PPID and platform manifest via EFI variables. This data can be manually transported to an internet-connected machine, registered with Intel PCS, and the resulting PCK certificates loaded into a local PCCS.
+2. **Option B: In-band registration via USB.** With `SgxPackageInfoInBandAccess=On`, extract platform provisioning data using `PCKIDRetrievalTool`, transport it to an internet-connected machine via USB, register with Intel, and bring collateral back.
 
-3. **PCCS as local cache:** After registration (by either method), fetch all collateral (PCK certs, TCB Info, QE Identity, CRLs) from Intel PCS on the internet-connected side, then load it into a PCCS running in the disconnected enclave via the `PUT /sgx/certification/v4/platformcollateral` API.
+After registration (either option), all attestation collateral must be loaded into a PCCS running in the disconnected enclave.
+
+See **[PREREQUISITES.md](PREREQUISITES.md)** for detailed steps for both options, including the full sneakernet workflow.
 
 ## Reboot Impact
 
