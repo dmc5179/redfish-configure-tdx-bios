@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import json
 import os
 import requests
 import urllib3
@@ -7,30 +8,37 @@ import sys
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# Attribute names for Dell PowerEdge R760 — NOT YET VERIFIED against live hardware.
+# These are the same names as the R660 (BIOS 2.7.x). If the R760 uses different
+# attribute names, update this map after running the audit and checking for MISS results.
 REQUIRED_SETTINGS = {
-    "NodeInterleaving": "Disabled",
-    "X2ApicMode": "Enabled",
-    "CpuPhysicalAddressLimit": "Disabled",
+    "NodeInterleave": "Disabled",
+    "ProcX2Apic": "Enabled",
     "MemoryEncryption": "MultipleKeys",
-    "GlobalMemoryIntegrity": "Disabled",
-    "IntelTdx": "Enabled",
-    "TmeMtTdxKeySplit": 1,
-    "TdxSeamLoader": "Enabled",
-    "IntelSgx": "Enabled",
+    "GlbMemIntegrity": "Disabled",
+    "EnableTdx": "Enabled",
+    "KeySplit": "1",
+    "EnableTdxSeamldr": "Enabled",
+    "IntelSgx": "On",
     "IntelTxt": "On",
 }
 
 PREREQUISITE_GROUP = {
-    "NodeInterleaving", "X2ApicMode", "CpuPhysicalAddressLimit",
-    "MemoryEncryption", "GlobalMemoryIntegrity", "IntelSgx", "IntelTxt",
+    "NodeInterleave", "ProcX2Apic",
+    "MemoryEncryption", "GlbMemIntegrity", "IntelSgx", "IntelTxt",
 }
 
-TDX_DEPENDENT_GROUP = {"IntelTdx", "TmeMtTdxKeySplit", "TdxSeamLoader"}
+TDX_DEPENDENT_GROUP = {"EnableTdx", "KeySplit", "EnableTdxSeamldr"}
+
+SGX_REGISTRATION_SETTINGS = {
+    "SgxAutoRegistrationAgent": "Enabled",
+    "SgxPackageInfoInBandAccess": "On",
+}
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Audit Dell PowerEdge R760 BIOS settings for Intel TDX readiness"
+        description="Audit Dell PowerEdge R760 BIOS settings for Intel TDX and SGX attestation readiness"
     )
     parser.add_argument(
         "--host", "-H",
@@ -47,6 +55,11 @@ def parse_args():
         default=os.environ.get("IDRAC_PASSWORD"),
         help="iDRAC password (env: IDRAC_PASSWORD)",
     )
+    parser.add_argument(
+        "--json", "-j",
+        action="store_true",
+        help="Output results as JSON",
+    )
     args = parser.parse_args()
     if not args.host:
         parser.error("--host is required (or set IDRAC_HOST)")
@@ -55,99 +68,183 @@ def parse_args():
     return args
 
 
-def audit_bios_settings(host, username, password):
+def fetch_bios_attributes(host, username, password):
     base_url = f"https://{host}/redfish/v1/Systems/System.Embedded.1/Bios"
+    response = requests.get(base_url, auth=(username, password), verify=False, timeout=30)
+    if response.status_code != 200:
+        print(f"Error: Unable to fetch BIOS configurations. Status Code: {response.status_code}")
+        sys.exit(1)
+    return response.json().get("Attributes", {})
 
-    print(f"Connecting to R760 iDRAC at {host} for TDX configuration audit...")
+
+def fetch_system_info(host, username, password):
+    url = f"https://{host}/redfish/v1/Systems/System.Embedded.1"
+    response = requests.get(url, auth=(username, password), verify=False, timeout=30)
+    if response.status_code != 200:
+        return {}
+    data = response.json()
+    return {
+        "Model": data.get("Model", "Unknown"),
+        "BiosVersion": data.get("BiosVersion", "Unknown"),
+        "Processor": data.get("ProcessorSummary", {}).get("Model", "Unknown"),
+    }
+
+
+def check_settings(current, required_map, group_label):
+    results = []
+    for setting in sorted(required_map):
+        req_value = required_map[setting]
+        curr_value = current.get(setting)
+        if curr_value is None:
+            results.append((setting, None, req_value, "MISS"))
+        elif str(curr_value).strip().lower() == str(req_value).strip().lower():
+            results.append((setting, curr_value, req_value, "PASS"))
+        else:
+            results.append((setting, curr_value, req_value, "FAIL"))
+    return results
+
+
+def audit_bios_settings(host, username, password, json_output=False):
     try:
-        response = requests.get(base_url, auth=(username, password), verify=False, timeout=15)
-        if response.status_code != 200:
-            print(f"Error: Unable to fetch BIOS configurations. Status Code: {response.status_code}")
-            sys.exit(1)
-        current_settings = response.json().get("Attributes", {})
+        sys_info = fetch_system_info(host, username, password)
+        current_settings = fetch_bios_attributes(host, username, password)
     except Exception as e:
         print(f"Connection failed: {e}")
         sys.exit(1)
 
-    mismatches = 0
-    prerequisite_changes = []
-    tdx_dependent_changes = []
-    tdx_attrs_missing = []
+    prereq_settings = {k: v for k, v in REQUIRED_SETTINGS.items() if k in PREREQUISITE_GROUP}
+    tdx_settings = {k: v for k, v in REQUIRED_SETTINGS.items() if k in TDX_DEPENDENT_GROUP}
 
-    print("\n=== INTEL TDX BIOS SETTINGS AUDIT REPORT (R760) ===\n")
-    print("--- Prerequisite Settings ---")
+    prereq_results = check_settings(current_settings, prereq_settings, "Prerequisite")
+    tdx_results = check_settings(current_settings, tdx_settings, "TDX-Dependent")
+    reg_results = check_settings(current_settings, SGX_REGISTRATION_SETTINGS, "SGX Registration")
 
-    for setting in sorted(PREREQUISITE_GROUP):
-        req_value = REQUIRED_SETTINGS[setting]
-        curr_value = current_settings.get(setting)
-        if str(curr_value).strip().lower() == str(req_value).strip().lower():
-            print(f"  [PASS] {setting}: '{curr_value}'")
+    all_results = prereq_results + tdx_results + reg_results
+    mismatches = sum(1 for _, _, _, s in all_results if s != "PASS")
+
+    if json_output:
+        output = {
+            "host": host,
+            "system": sys_info,
+            "tdx_ready": all(s == "PASS" for _, _, _, s in prereq_results + tdx_results),
+            "attestation_ready": all(s == "PASS" for _, _, _, s in reg_results),
+            "settings": {},
+        }
+        for name, curr, req, status in all_results:
+            output["settings"][name] = {
+                "current": curr, "required": req, "status": status,
+            }
+        print(json.dumps(output, indent=2))
+        return mismatches
+
+    model = sys_info.get("Model", "R760")
+    bios_ver = sys_info.get("BiosVersion", "?")
+    proc = sys_info.get("Processor", "?")
+    print(f"Target: {model} | BIOS {bios_ver} | {proc}")
+    print(f"iDRAC:  {host}")
+
+    print(f"\n{'=' * 60}")
+    print(f" INTEL TDX BIOS AUDIT REPORT")
+    print(f"{'=' * 60}")
+
+    print("\n--- Prerequisite Settings ---")
+    for name, curr, req, status in prereq_results:
+        if status == "PASS":
+            print(f"  [PASS] {name}: '{curr}'")
+        elif status == "MISS":
+            print(f"  [MISS] {name}: not present in BIOS")
         else:
-            print(f"  [FAIL] {setting}: '{curr_value}' -> needs '{req_value}'")
-            prerequisite_changes.append(setting)
-            mismatches += 1
+            print(f"  [FAIL] {name}: '{curr}' -> needs '{req}'")
 
     print("\n--- TDX-Dependent Settings ---")
-
-    for setting in sorted(TDX_DEPENDENT_GROUP):
-        req_value = REQUIRED_SETTINGS[setting]
-        curr_value = current_settings.get(setting)
-        if curr_value is None:
-            print(f"  [MISS] {setting}: attribute not present in BIOS (requires TME-MT active)")
-            tdx_attrs_missing.append(setting)
-            mismatches += 1
-        elif str(curr_value).strip().lower() == str(req_value).strip().lower():
-            print(f"  [PASS] {setting}: '{curr_value}'")
+    for name, curr, req, status in tdx_results:
+        if status == "PASS":
+            print(f"  [PASS] {name}: '{curr}'")
+        elif status == "MISS":
+            print(f"  [MISS] {name}: not present (requires TME-MT active)")
         else:
-            print(f"  [FAIL] {setting}: '{curr_value}' -> needs '{req_value}'")
-            tdx_dependent_changes.append(setting)
-            mismatches += 1
+            print(f"  [FAIL] {name}: '{curr}' -> needs '{req}'")
 
-    print("\n=== REBOOT ANALYSIS ===")
+    print("\n--- SGX Attestation Registration ---")
+    for name, curr, req, status in reg_results:
+        if status == "PASS":
+            print(f"  [PASS] {name}: '{curr}'")
+        elif status == "MISS":
+            print(f"  [MISS] {name}: not present in BIOS")
+        else:
+            print(f"  [FAIL] {name}: '{curr}' -> needs '{req}'")
 
-    has_prereq_changes = len(prerequisite_changes) > 0
-    has_tdx_changes = len(tdx_dependent_changes) > 0 or len(tdx_attrs_missing) > 0
+    sgx_factory = current_settings.get("SgxFactoryReset", "Off")
+    print(f"  [INFO] SgxFactoryReset: '{sgx_factory}'")
 
-    if not has_prereq_changes and not has_tdx_changes:
-        reboots = 0
+    prereq_failures = [n for n, _, _, s in prereq_results if s != "PASS"]
+    tdx_failures = [n for n, _, _, s in tdx_results if s != "PASS"]
+    reg_failures = [n for n, _, _, s in reg_results if s != "PASS"]
+
+    print(f"\n{'=' * 60}")
+    print(f" REBOOT ANALYSIS")
+    print(f"{'=' * 60}")
+
+    tdx_ok = not prereq_failures and not tdx_failures
+    reg_ok = not reg_failures
+
+    if tdx_ok and reg_ok:
         print("No changes required. No reboot needed.")
-    elif has_prereq_changes and has_tdx_changes:
-        reboots = 2
-        print(f"Prerequisite changes (reboot 1): {', '.join(prerequisite_changes)}")
-        if tdx_dependent_changes:
-            print(f"TDX-dependent changes (reboot 2): {', '.join(tdx_dependent_changes)}")
-        if tdx_attrs_missing:
-            print(f"TDX attributes not yet visible (reboot 2): {', '.join(tdx_attrs_missing)}")
-            print("  These attributes will appear after MemoryEncryption=MultipleKeys")
-            print("  is applied and the server completes a reboot.")
-        print(f"\nESTIMATED REBOOTS REQUIRED: {reboots}")
     else:
-        reboots = 1
-        if has_prereq_changes:
-            print(f"Prerequisite changes (reboot 1): {', '.join(prerequisite_changes)}")
-        if tdx_dependent_changes:
-            print(f"TDX-dependent changes (reboot 1): {', '.join(tdx_dependent_changes)}")
-        if tdx_attrs_missing:
-            print(f"TDX attributes not yet visible: {', '.join(tdx_attrs_missing)}")
+        reboots = 0
+        if prereq_failures and tdx_failures:
+            reboots = 2
+            print(f"Prerequisite changes (reboot 1): {', '.join(prereq_failures)}")
+            print(f"TDX-dependent changes (reboot 2): {', '.join(tdx_failures)}")
+            if not reg_ok:
+                print(f"SGX registration changes (combined with reboot 1): {', '.join(reg_failures)}")
+        elif prereq_failures or tdx_failures:
+            reboots = 1
+            changes = prereq_failures + tdx_failures
+            print(f"TDX changes (reboot 1): {', '.join(changes)}")
+            if not reg_ok:
+                print(f"SGX registration changes (same reboot): {', '.join(reg_failures)}")
+        elif not reg_ok:
+            reboots = 1
+            print(f"SGX registration changes (reboot 1): {', '.join(reg_failures)}")
+
         print(f"\nESTIMATED REBOOTS REQUIRED: {reboots}")
 
-    if has_tdx_changes and "TdxSeamLoader" in (tdx_dependent_changes + tdx_attrs_missing):
-        print("\nNOTE: Enabling the SEAM loader may require a full power cycle")
-        print("(not just a warm reboot) for proper initialization.")
+        if "EnableTdxSeamldr" in tdx_failures:
+            print("\nNOTE: Enabling the SEAM loader may require a full power cycle")
+            print("(not just a warm reboot) for proper initialization.")
 
-    if reboots > 0:
+        if not reg_ok:
+            print("\nNOTE: After enabling SgxAutoRegistrationAgent, the BIOS will")
+            print("attempt to register the platform with Intel on next boot.")
+            print("This requires outbound HTTPS to Intel Registration Service.")
+            print("After successful registration, PCK certificates become available")
+            print("and TDX remote attestation can complete end-to-end.")
+            if sgx_factory == "Off":
+                print("\nIf this platform has never been registered, you may also need")
+                print("to set SgxFactoryReset=On (one-time) to trigger Initial")
+                print("Platform Establishment. Use --sgx-factory-reset with the")
+                print("remediate script.")
+
         print("\nOS IMPACT: Each reboot causes downtime for the operating system")
         print("and all workloads on this host. Drain or cordon the node first.")
 
-    print("\n=== AUDIT SUMMARY ===")
-    if mismatches == 0:
-        print("All required BIOS settings are correctly configured for Intel TDX.")
+    print(f"\n{'=' * 60}")
+    print(f" SUMMARY")
+    print(f"{'=' * 60}")
+    if tdx_ok:
+        print("TDX:          READY")
     else:
-        print(f"{mismatches} setting(s) must be corrected before Intel TDX can be enabled.")
+        count = len(prereq_failures) + len(tdx_failures)
+        print(f"TDX:          {count} setting(s) need correction")
+    if reg_ok:
+        print("Attestation:  READY (SGX registration configured)")
+    else:
+        print(f"Attestation:  {len(reg_failures)} setting(s) need correction")
 
     return mismatches
 
 
 if __name__ == "__main__":
     args = parse_args()
-    sys.exit(0 if audit_bios_settings(args.host, args.username, args.password) == 0 else 1)
+    sys.exit(0 if audit_bios_settings(args.host, args.username, args.password, args.json) == 0 else 1)
