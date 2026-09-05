@@ -5,6 +5,8 @@ import requests
 import urllib3
 import sys
 
+from idrac_common import get_idrac_info, create_bios_config_job_and_reboot
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Attribute names match Dell PowerEdge R660 iDRAC BIOS firmware 2.7.x
@@ -73,10 +75,12 @@ def parse_args():
 def apply_tdx_settings(host, username, password, sgx_factory_reset=False, dry_run=False):
     base_url = f"https://{host}/redfish/v1/Systems/System.Embedded.1/Bios"
     settings_url = f"{base_url}/Settings"
-    jobs_url = f"https://{host}/redfish/v1/Managers/iDRAC.Embedded.1/JobService/Actions/JobService.CreateJobAndReboot"
 
-    print(f"Step 1: Connecting to R660 iDRAC at {host} to verify current config...")
+    print(f"Step 1: Connecting to R660 iDRAC at {host}...")
     try:
+        idrac_info = get_idrac_info(host, username, password)
+        print(f"  iDRAC firmware: {idrac_info['FirmwareVersion']}")
+
         response = requests.get(base_url, auth=(username, password), verify=False, timeout=30)
         if response.status_code != 200:
             print(f"Error fetching BIOS attributes: {response.status_code}")
@@ -161,24 +165,10 @@ def apply_tdx_settings(host, username, password, sgx_factory_reset=False, dry_ru
         sys.exit(1)
 
     print("Step 3: Creating iDRAC config job and initiating reboot...")
-    reboot_payload = {
-        "RebootJobType": "GracefulRebootWithPowerCycle",
-        "TargetSettingsURI": "/redfish/v1/Systems/System.Embedded.1/Bios/Settings",
-    }
-
-    try:
-        job_resp = requests.post(
-            jobs_url, auth=(username, password), json=reboot_payload, verify=False, timeout=30
-        )
-        if job_resp.status_code in [200, 201, 202]:
-            print("Remediation job scheduled. The server will now reboot.")
-        else:
-            print(f"Reboot / Job creation failed: {job_resp.status_code} - {job_resp.text}")
-            sys.exit(1)
-    except Exception as e:
-        print(f"Job creation connection error: {e}")
+    if not create_bios_config_job_and_reboot(host, username, password):
         sys.exit(1)
 
+    print("\nRemediation job scheduled. The server will now reboot.")
     print()
     if needs_rerun:
         print("=" * 70)

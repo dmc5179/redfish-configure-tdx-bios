@@ -6,7 +6,7 @@ Scripts for auditing and remediating Intel TDX BIOS settings on Dell PowerEdge s
 
 | Model | Audit | Remediate | Verified |
 |-------|-------|-----------|----------|
-| Dell PowerEdge R660 | `r660_tdx_audit.py` | `r660_tdx_remediate.py` | BIOS 2.7.5 |
+| Dell PowerEdge R660 | `r660_tdx_audit.py` | `r660_tdx_remediate.py` | BIOS 2.7.5, iDRAC 7.10.30.05 |
 | Dell PowerEdge R760 | `r760_tdx_audit.py` | `r760_tdx_remediate.py` | Not yet verified — attribute names may differ |
 
 ## Prerequisites
@@ -100,6 +100,19 @@ When both prerequisite and TDX-dependent settings need changes, the script handl
 
 This two-phase approach is necessary because TDX BIOS attributes are not visible until TME-MT is active.
 
+## iDRAC Firmware Compatibility
+
+The remediate scripts auto-detect the correct Redfish endpoint for creating BIOS config jobs:
+
+| iDRAC firmware | Job creation method |
+|---------------|-------------------|
+| Older (has `JobService.CreateJobAndReboot`) | Single POST to `JobService/Actions/JobService.CreateJobAndReboot` |
+| Newer / 7.x (Dell OEM) | Two-step: POST to `Oem/Dell/Jobs` to create config job, then `ComputerSystem.Reset` with `PowerCycle` |
+
+The scripts try the legacy endpoint first; if it returns 404, they automatically fall back to the Dell OEM flow. No manual configuration needed.
+
+Shared logic lives in `idrac_common.py`, which both remediate scripts import.
+
 ## SGX Attestation Registration
 
 TDX remote attestation requires the platform to be registered with Intel's Registration Service. Two BIOS settings control this:
@@ -114,7 +127,15 @@ If the platform has never been registered (e.g., Intel PCS returns 404 for PCK c
 ./r660_tdx_remediate.py --host 10.0.0.1 --password secret --sgx-factory-reset
 ```
 
-After registration, PCK certificates become available from Intel PCS, enabling the full attestation chain: QGS quote generation -> PCCS collateral -> KBS/Trustee verification.
+### Disconnected / Air-Gapped Environments
+
+The BIOS MPA registers directly with Intel's cloud service, which won't work in a disconnected environment. For air-gapped deployments:
+
+1. **Pre-deployment (internet-connected):** Enable `SgxAutoRegistrationAgent` and reboot the server while it still has outbound HTTPS access. After the one-time registration, the platform identity persists — internet is no longer needed.
+
+2. **Or use in-band registration:** With `SgxPackageInfoInBandAccess=On`, the OS can read the platform's encrypted PPID and platform manifest via EFI variables. This data can be manually transported to an internet-connected machine, registered with Intel PCS, and the resulting PCK certificates loaded into a local PCCS.
+
+3. **PCCS as local cache:** After registration (by either method), fetch all collateral (PCK certs, TCB Info, QE Identity, CRLs) from Intel PCS on the internet-connected side, then load it into a PCCS running in the disconnected enclave via the `PUT /sgx/certification/v4/platformcollateral` API.
 
 ## Reboot Impact
 
@@ -123,7 +144,7 @@ Each reboot causes full OS downtime. If the server is an OpenShift node:
 1. Cordon and drain the node before running the remediate script
 2. After the final reboot, uncordon the node
 
-The SEAM loader may require a full power cycle (not just a warm reboot) to initialize. The iDRAC jobs use `GracefulRebootWithPowerCycle`.
+The SEAM loader may require a full power cycle (not just a warm reboot) to initialize. The remediate scripts use `PowerCycle` reset type.
 
 ## Required BIOS Settings
 
